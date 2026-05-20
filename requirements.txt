@@ -1,1 +1,5 @@
-# Project dependencies
+streamlit
+yfinance
+pandas
+matplotlib
+plotly
