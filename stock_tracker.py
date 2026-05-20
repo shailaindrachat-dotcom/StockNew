@@ -251,31 +251,101 @@ else:
     all_data = {name: get_stock_data(ticker, fetch_period, tail_days)}
 
 # ─────────────────────────────────────────────
-# Render Cards
+# Render Helper
 # ─────────────────────────────────────────────
-num_cols = 2 if len(stocks_to_display) > 1 else 1
-cols = st.columns(num_cols)
+# Fixed pixel heights ensure both cards in a row grow to the same size,
+# preventing the left/right drift that happens when Streamlit columns
+# accumulate content independently.
+CHART_HEIGHT   = 400   # px — same for every card
+TABLE_HEIGHT   = 310   # px — fits 15 rows without scrolling
+OVERVIEW_MODE  = len(stocks_to_display) > 1
 
-for index, (company_name, ticker) in enumerate(stocks_to_display.items()):
-    col = cols[index % num_cols]
+
+def build_chart(chart_df: pd.DataFrame) -> go.Figure:
+    """Build the candlestick (+ optional SMA / volume) figure."""
+    row_heights = [0.65, 0.35] if show_volume else [1.0]
+    rows = 2 if show_volume else 1
+
+    fig = make_subplots(
+        rows=rows, cols=1,
+        shared_xaxes=True,
+        row_heights=row_heights,
+        vertical_spacing=0.03,
+        subplot_titles=["Price", "Volume"] if show_volume else ["Price"],
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=chart_df.index,
+            open=chart_df["Open"], high=chart_df["High"],
+            low=chart_df["Low"],  close=chart_df["Close"],
+            name="Price",
+            increasing_line_color="#26a69a",
+            decreasing_line_color="#ef5350",
+        ),
+        row=1, col=1,
+    )
+
+    if show_sma10 and "SMA_10" in chart_df.columns:
+        fig.add_trace(
+            go.Scatter(x=chart_df.index, y=chart_df["SMA_10"],
+                       mode="lines", name="10-Day SMA",
+                       line=dict(color="#2196F3", width=1.5)),
+            row=1, col=1,
+        )
+
+    if show_sma20 and "SMA_20" in chart_df.columns:
+        fig.add_trace(
+            go.Scatter(x=chart_df.index, y=chart_df["SMA_20"],
+                       mode="lines", name="20-Day SMA",
+                       line=dict(color="#FF9800", width=1.5)),
+            row=1, col=1,
+        )
+
+    if show_volume:
+        vol_colors = [
+            "#26a69a" if c >= o else "#ef5350"
+            for c, o in zip(chart_df["Close"], chart_df["Open"])
+        ]
+        fig.add_trace(
+            go.Bar(x=chart_df.index, y=chart_df["Volume"],
+                   name="Volume", marker_color=vol_colors, opacity=0.6),
+            row=2, col=1,
+        )
+
+    fig.update_layout(
+        xaxis_rangeslider_visible=False,
+        height=CHART_HEIGHT,                          # ← fixed height
+        margin=dict(l=0, r=0, t=25, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
+    return fig
+
+
+def render_card(container, company_name: str, ticker: str) -> None:
+    """Render one stock card into the given Streamlit container."""
     chart_df, table_df, news, error_msg = all_data[company_name]
 
-    with col:
+    with container:
         st.subheader(f":blue[{company_name}] ({ticker})")
 
-        # FIX #7: descriptive warning on bad tickers
         if error_msg or table_df.empty:
+            # Pad with empty space so the error card matches the height of a
+            # successful card and doesn't throw off row alignment.
             st.warning(
                 f"⚠️ **{company_name}** — "
                 + (error_msg or "No data available. Symbol may be delisted or incorrect.")
             )
-            if num_cols > 1:
-                st.divider()
-            continue
+            st.empty()   # placeholder keeps vertical rhythm
+            st.divider()
+            return
 
         latest_close = table_df["Close"].iloc[-1]
 
-        # FIX #5: guard pct_change against single-row DataFrames
         if len(table_df) >= 2:
             previous_close = table_df["Close"].iloc[-2]
             pct_change = ((latest_close - previous_close) / previous_close) * 100
@@ -284,118 +354,42 @@ for index, (company_name, ticker) in enumerate(stocks_to_display.items()):
 
         latest_rsi = table_df["RSI"].iloc[-1]
 
-        # ── Top Metrics ─────────────────────────────────────────────────
+        # ── Metrics ─────────────────────────────────────────────────────
         m1, m2, m3 = st.columns(3)
         m1.metric("Latest Close", f"₹{latest_close:.2f}", f"{pct_change:+.2f}%")
 
-        # FIX #6: RSI color logic — use neutral delta_color, convey signal via emoji label
         if latest_rsi > 70:
-            rsi_label, rsi_icon = "Overbought 🔴", "off"
+            rsi_label = "Overbought 🔴"
         elif latest_rsi < 30:
-            rsi_label, rsi_icon = "Oversold 🟢", "off"
+            rsi_label = "Oversold 🟢"
         else:
-            rsi_label, rsi_icon = "Neutral 🟡", "off"
-        m2.metric("RSI (14-Day)", f"{latest_rsi:.2f}", delta=rsi_label, delta_color=rsi_icon)
+            rsi_label = "Neutral 🟡"
+        m2.metric("RSI (14-Day)", f"{latest_rsi:.2f}", delta=rsi_label, delta_color="off")
 
-        # Volume in the 3rd metric tile
         latest_vol = int(table_df["Volume"].iloc[-1])
-        vol_display = f"{latest_vol/1_000_000:.2f}M" if latest_vol >= 1_000_000 else f"{latest_vol:,}"
+        vol_display = (
+            f"{latest_vol / 1_000_000:.2f}M" if latest_vol >= 1_000_000 else f"{latest_vol:,}"
+        )
         m3.metric("Volume (Latest)", vol_display)
 
-        # ── Candlestick + Volume Chart — FIX #8 ─────────────────────────
-        row_heights = [0.65, 0.35] if show_volume else [1.0]
-        rows = 2 if show_volume else 1
+        # ── Chart ────────────────────────────────────────────────────────
+        st.plotly_chart(build_chart(chart_df), use_container_width=True)
 
-        fig = make_subplots(
-            rows=rows, cols=1,
-            shared_xaxes=True,
-            row_heights=row_heights,
-            vertical_spacing=0.03,
-            subplot_titles=["Price", "Volume"] if show_volume else ["Price"],
-        )
-
-        # Candlestick
-        fig.add_trace(
-            go.Candlestick(
-                x=chart_df.index,
-                open=chart_df["Open"],
-                high=chart_df["High"],
-                low=chart_df["Low"],
-                close=chart_df["Close"],
-                name="Price",
-                increasing_line_color="#26a69a",
-                decreasing_line_color="#ef5350",
-            ),
-            row=1, col=1,
-        )
-
-        # 10-Day SMA
-        if show_sma10 and "SMA_10" in chart_df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=chart_df.index, y=chart_df["SMA_10"],
-                    mode="lines", name="10-Day SMA",
-                    line=dict(color="#2196F3", width=1.5),
-                ),
-                row=1, col=1,
-            )
-
-        # 20-Day SMA
-        if show_sma20 and "SMA_20" in chart_df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=chart_df.index, y=chart_df["SMA_20"],
-                    mode="lines", name="20-Day SMA",
-                    line=dict(color="#FF9800", width=1.5),
-                ),
-                row=1, col=1,
-            )
-
-        # Volume bars
-        if show_volume:
-            vol_colors = [
-                "#26a69a" if c >= o else "#ef5350"
-                for c, o in zip(chart_df["Close"], chart_df["Open"])
-            ]
-            fig.add_trace(
-                go.Bar(
-                    x=chart_df.index, y=chart_df["Volume"],
-                    name="Volume",
-                    marker_color=vol_colors,
-                    opacity=0.6,
-                ),
-                row=2, col=1,
-            )
-
-        chart_height = 420 if num_cols == 1 else 370
-        fig.update_layout(
-            xaxis_rangeslider_visible=False,
-            height=chart_height,
-            margin=dict(l=0, r=0, t=25, b=0),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        fig.update_xaxes(showgrid=False)
-        fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        # ── Historical Data Table ────────────────────────────────────────
+        # ── Table — fixed height so both columns stay in sync ────────────
         st.write("**15-Day Historical Data**")
         styled_df = (
             table_df.style
             .background_gradient(subset=["Close"], cmap="Blues")
             .background_gradient(subset=["Volume"], cmap="Purples")
             .format({
-                "Open": "₹{:.2f}", "High": "₹{:.2f}",
-                "Low": "₹{:.2f}", "Close": "₹{:.2f}",
-                "Volume": "{:,.0f}", "RSI": "{:.2f}",
+                "Open":   "₹{:.2f}", "High":  "₹{:.2f}",
+                "Low":    "₹{:.2f}", "Close": "₹{:.2f}",
+                "Volume": "{:,.0f}", "RSI":   "{:.2f}",
             })
         )
-        st.dataframe(styled_df, use_container_width=True)
+        st.dataframe(styled_df, use_container_width=True, height=TABLE_HEIGHT)
 
-        # ── Latest News ──────────────────────────────────────────────────
+        # ── News ─────────────────────────────────────────────────────────
         with st.expander("📰 View Latest News"):
             if news:
                 for article in news:
@@ -406,8 +400,36 @@ for index, (company_name, ticker) in enumerate(stocks_to_display.items()):
             else:
                 st.write("No recent news found for this ticker.")
 
-        if num_cols > 1:
-            st.divider()
+        st.divider()
+
+
+# ─────────────────────────────────────────────
+# Render Cards
+# ─────────────────────────────────────────────
+stock_items = list(stocks_to_display.items())
+
+if not OVERVIEW_MODE:
+    # Single-stock view — one full-width card
+    company_name, ticker = stock_items[0]
+    render_card(st.container(), company_name, ticker)
+else:
+    # Overview mode — render one ROW at a time so each pair of columns
+    # starts fresh at the same vertical position.  This is the key fix:
+    # a single st.columns([1,1]) shared across all stocks would let the
+    # two sides drift apart; creating a new pair per row keeps them locked.
+    for i in range(0, len(stock_items), 2):
+        left_name,  left_ticker  = stock_items[i]
+        has_right = i + 1 < len(stock_items)
+
+        if has_right:
+            right_name, right_ticker = stock_items[i + 1]
+            col_left, col_right = st.columns(2)
+            render_card(col_left,  left_name,  left_ticker)
+            render_card(col_right, right_name, right_ticker)
+        else:
+            # Odd stock out — render in left half, leave right blank
+            col_left, _ = st.columns(2)
+            render_card(col_left, left_name, left_ticker)
 
 # ─────────────────────────────────────────────
 # Footer
